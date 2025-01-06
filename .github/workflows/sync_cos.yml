@@ -1,0 +1,100 @@
+name: Sync COS to GitHub
+
+on:
+  schedule:
+    - cron: '0 1 * * 1' # 每周一北京时间早上九点（UTC时间每周日晚上17:00）
+  workflow_dispatch: # 手动触发工作流
+
+jobs:
+  sync-cos:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      # 检出仓库代码
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+      # 设置 Python 环境为 3.11
+
+    - name: Install COSCMD
+      run: pip install coscmd
+      # 安装 coscmd 工具
+
+    - name: Create cos_content directory
+      run: mkdir -p cos_content
+      # 创建存储 COS 内容的目录
+
+    - name: Modify cos_cmd.py for configparser compatibility
+      run: |
+        sed -i 's/from six.moves.configparser import SafeConfigParser/from configparser import ConfigParser as SafeConfigParser/g' $(python -c "import site; print(site.getsitepackages()[0])")/coscmd/cos_cmd.py
+      # 修改 coscmd 库中的配置解析部分，以适应 Python 3.11 的 configparser 标准
+
+    - name: Configure COSCMD
+      env:
+          COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
+          COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
+          COS_BUCKET_NAME: ${{ secrets.COS_BUCKET_NAME }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+      run: |
+        coscmd config -a $COS_SECRET_ID -s $COS_SECRET_KEY -b $COS_BUCKET_NAME -r $COS_REGION  
+      # 配置 COSCMD，生成 ~/.cos.conf 文件，包含必要的 COS 认证信息和区域信息
+
+    - name: Set DATE environment variable
+      run: echo "DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
+
+    - name: Download COS content
+      run: coscmd download -r / cos_content/
+      # 使用 coscmd 下载 COS 内容到 cos_content 目录，传递正确的 COS_REGION 环境变量
+
+    - name: Commit and push changes using SSH
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        SYNC_TIME: ${{ env.DATE }}
+      run: |
+        cd cos_content
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git init
+        git remote add origin git@github.com:${{ github.repository }}.git
+        git add .
+        git commit -m "同步 腾讯云COS 内容于 ${SYNC_TIME}"
+        # Configure SSH
+        mkdir -p ~/.ssh
+        echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        # Push using SSH
+        git push -f origin HEAD:Tencent-cos-sync
+
+
+        
+    - name: Translate job status to Chinese
+      id: translate-status
+      run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "translated_status=成功" >> $GITHUB_ENV
+          elif [ "${{ job.status }}" == "failure" ]; then
+            echo "translated_status=失败" >> $GITHUB_ENV
+          elif [ "${{ job.status }}" == "cancelled" ]; then
+            echo "translated_status=取消" >> $GITHUB_ENV
+          else
+            echo "translated_status=未知" >> $GITHUB_ENV
+          fi
+
+    - name: Notify job status
+      if: always()  # 确保这一步始终运行，不管之前的步骤是否成功
+      run: |
+        curl -X "POST" "${{ secrets.BARK_KEY }}" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -d '{
+                  "body": "${{ github.repository }}于${{ env.DATE }}运行${{ env.translated_status }}",
+                  "title": "Github Actions",
+                  "badge": 1,
+                  "category": "Github Actions",
+                  "sound": "multiwayinvitation.caf",
+                  "icon": "https://cdn.pixabay.com/photo/2022/01/30/13/33/github-6980894_1280.png",
+                  "group": "Github Actions"
+                }'
